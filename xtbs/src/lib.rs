@@ -1,114 +1,270 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     path::{Path, PathBuf},
+    sync::{Mutex, mpsc::Sender},
 };
 
 pub use anyhow;
 pub use serde;
 
-struct GraphNode<'job> {
-    job: Job<'job>,
+pub trait IntoAnyhowResult<T> {
+    fn into_anyhow_result(self) -> anyhow::Result<T>;
+}
+
+impl<T> IntoAnyhowResult<T> for anyhow::Result<T> {
+    fn into_anyhow_result(self) -> anyhow::Result<T> {
+        self.map_err(Into::into)
+    }
+}
+
+impl<T> IntoAnyhowResult<T> for T {
+    fn into_anyhow_result(self) -> anyhow::Result<T> {
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Default)]
+struct NodeRelation {
     input_edges: Vec<JobId>,
     output_edges: Vec<JobId>,
 }
 
+type BoxJobExec<'job> = Box<dyn FnOnce(&mut Job) -> anyhow::Result<()> + Send + 'job>;
+
 pub struct TaskGraph<'job> {
-    jobs: Vec<Job<'job>>,
+    jobs: Vec<Mutex<Job>>,
+    exec: Vec<Option<BoxJobExec<'job>>>,
 }
 
 impl<'job> TaskGraph<'job> {
     pub fn new() -> Self {
-        TaskGraph { jobs: Vec::new() }
+        TaskGraph {
+            jobs: Vec::new(),
+            exec: Vec::new(),
+        }
     }
 
-    pub fn add_job<F>(&mut self, spec: JobSpec, f: F) -> JobId
+    pub fn add_job<F, R>(&mut self, spec: Job, f: F) -> JobId
     where
-        F: FnOnce(&mut JobSpec) -> anyhow::Result<()> + Send + 'job,
+        F: FnOnce(&mut Job) -> R + Send + 'job,
+        R: IntoAnyhowResult<()>,
     {
         let id = JobId(self.jobs.len());
 
-        self.jobs.push(Job {
-            spec,
-            exec: Box::new(f),
-        });
+        self.jobs.push(Mutex::new(spec));
+        self.exec.push(Some(Box::new(move |job| {
+            let result = f(job);
+            result.into_anyhow_result()
+        })));
 
         id
     }
 
-    pub fn run(self) -> anyhow::Result<()> {
-        let mut graph: Vec<GraphNode> = Vec::with_capacity(self.jobs.len());
+    pub fn run(mut self) -> anyhow::Result<()> {
+        let relations = self.build_relations()?;
+
+        let (mut unresolved_input_counts, mut ready_jobs) = self.build_input_counts(&relations);
+
+        // Channel to communicate finished jobs back to the main thread
+        let (sender, receiver) = std::sync::mpsc::channel::<(JobId, anyhow::Result<()>)>();
+
+        let results = rayon::in_place_scope(|scope| {
+            let mut active_jobs = 0_usize;
+            let mut results = Vec::new();
+            results.resize_with(self.jobs.len(), || None);
+
+            // Launch all the ready to run jobs
+            for job_id in ready_jobs.drain(..) {
+                Self::launch_job(
+                    &self.jobs,
+                    &mut self.exec,
+                    &mut active_jobs,
+                    scope,
+                    &sender,
+                    job_id,
+                );
+            }
+
+            // Wait for jobs to finish
+            while let Some((job_id, result)) = {
+                // If there are no more active jobs, we can break out of the loop
+                if active_jobs != 0 {
+                    receiver.recv().ok()
+                } else {
+                    None
+                }
+            } {
+                // Decrement the active job count
+                active_jobs -= 1;
+
+                let errored = result.is_err();
+
+                // Store the result
+                results[job_id.0] = Some(result);
+
+                if errored {
+                    continue;
+                }
+
+                // Decrement the unresolved input counts for all jobs that depend on this job
+                for output_job_id in &relations[job_id.0].output_edges {
+                    let count = &mut unresolved_input_counts[output_job_id.0];
+                    *count -= 1;
+                    if *count == 0 {
+                        // This job is now ready to run
+                        ready_jobs.push(*output_job_id);
+                    }
+                }
+
+                // Launch all the ready to run jobs
+                for job_id in ready_jobs.drain(..) {
+                    Self::launch_job(
+                        &self.jobs,
+                        &mut self.exec,
+                        &mut active_jobs,
+                        scope,
+                        &sender,
+                        job_id,
+                    );
+                }
+            }
+            results
+        });
+
+        // If there were any errors, print them out, then return an error.
+        let mut any_failed = false;
+        for (job_id, result) in results.into_iter().enumerate() {
+            if let Some(Err(err)) = result {
+                any_failed = true;
+                eprintln!(
+                    "Job \"{}\"(ID {}) failed: {:#?}",
+                    self.jobs[job_id].get_mut().unwrap().name,
+                    job_id,
+                    err
+                );
+            }
+        }
+
+        if any_failed {
+            return Err(anyhow::anyhow!("One or more jobs failed."));
+        }
+
+        // If there are any jobs that still have unresolved input edges,
+        // there was a cycle in the graph.
+        for (job_id, count) in unresolved_input_counts.iter_mut().enumerate() {
+            if *count > 0 {
+                return Err(anyhow::anyhow!(
+                    "Job \"{}\"(ID {}) was part of a cycle in the graph.",
+                    self.jobs[job_id].get_mut().unwrap().name,
+                    job_id,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn build_relations(&mut self) -> anyhow::Result<Vec<NodeRelation>> {
+        let mut relations: Vec<NodeRelation> = vec![NodeRelation::default(); self.jobs.len()];
         let mut output_files: HashMap<PathBuf, JobId> = HashMap::with_capacity(self.jobs.len());
 
-        for job in self.jobs {
-            let job_id = JobId(graph.len());
+        for (index, job) in self.jobs.iter_mut().enumerate() {
+            let job_id = JobId(index);
+            let job = job.get_mut().unwrap();
 
-            let mut this_node = GraphNode {
-                job,
-                input_edges: Vec::new(),
-                output_edges: Vec::new(),
-            };
+            for output in &job.outputs {
+                match output {
+                    JobOutput::File(path) => match output_files.entry(path.clone()) {
+                        Entry::Occupied(_) => {
+                            return Err(anyhow::anyhow!(
+                                "Duplicate output file: {}",
+                                path.display()
+                            ));
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(job_id);
+                        }
+                    },
+                    JobOutput::Data(_) => {
+                        // Data outputs don't create edges
+                    }
+                }
+            }
+        }
+        // First iterate over all outputs, ensuring there are no duplicate outputs,
+        // and building the mapping from path to job id.
 
-            // First iterate over all inputs to connect them to the
-            // outputs of other jobs.
-            for input in &this_node.job.spec.inputs {
-                match input {
+        // Now iterate over all inputs, connecting them with the outputs.
+        for (index, job) in self.jobs.iter_mut().enumerate() {
+            let job_id = JobId(index);
+            let job = job.get_mut().unwrap();
+
+            for output in &job.inputs {
+                match output {
                     JobInput::File(path) => {
                         if let Some(&matching_node) = output_files.get(path) {
-                            this_node.input_edges.push(matching_node);
-                            graph[matching_node.0].output_edges.push(job_id);
+                            relations[matching_node.0].output_edges.push(job_id);
+                            relations[job_id.0].input_edges.push(matching_node);
                         }
+                        // If there is no match, that's fine, the input is
+                        // used for hashing, not dependency ordering.
                     }
                     JobInput::Job(matching_node) => {
-                        this_node.input_edges.push(*matching_node);
-                        graph[matching_node.0].output_edges.push(job_id);
+                        relations[matching_node.0].output_edges.push(job_id);
+                        relations[job_id.0].input_edges.push(*matching_node);
                     }
                     JobInput::Data(_) | JobInput::Always => {
                         // Data and always inputs don't create edges
                     }
                 }
             }
-
-            // Iterate over all outputs to ensure that there are no double outputs,
-            // and to connect them to the inputs of other jobs.
-            for output in &this_node.job.spec.outputs {
-                match output {
-                    JobOutput::File(path) => {
-                        if let Some(&matching_node) = output_files.get(path) {
-                            // We have more than one job that outputs to this file,
-                            // so we treat it as both an input and an output.
-                            this_node.input_edges.push(matching_node);
-                            graph[matching_node.0].output_edges.push(job_id);
-                        }
-                        // Insert our output into the map, overwriting any
-                        // existing entry. Because we establish an input edge,
-                        // all future nodes only need to attach to us to get defined
-                        // ordering.
-                        output_files.insert(path.clone(), job_id);
-                    }
-                    JobOutput::Data(_) => {
-                        // Data outputs don't create edges
-                    }
-                }
-            }
-
-            graph.push(this_node);
         }
+        Ok(relations)
+    }
 
-        // Find any cycles in the graph and error out if we find one.
+    fn build_input_counts(&self, relations: &Vec<NodeRelation>) -> (Vec<usize>, Vec<JobId>) {
+        // Build a count of all the unresolved input edges for every job
+        let mut unresolved_input_counts: Vec<usize> = Vec::with_capacity(self.jobs.len());
+        let mut ready_jobs: Vec<JobId> = Vec::with_capacity(self.jobs.len());
 
-        Ok(())
+        for (id, relation) in relations.iter().enumerate() {
+            let job_id = JobId(id);
+
+            let input_edges = relation.input_edges.len();
+            unresolved_input_counts.push(input_edges);
+            if input_edges == 0 {
+                ready_jobs.push(job_id);
+            }
+        }
+        (unresolved_input_counts, ready_jobs)
+    }
+
+    fn launch_job<'scope>(
+        jobs: &'scope Vec<Mutex<Job>>,
+        exec: &mut Vec<Option<BoxJobExec<'job>>>,
+        active_jobs: &mut usize,
+        scope: &rayon::Scope<'scope>,
+        sender: &'scope Sender<(JobId, anyhow::Result<()>)>,
+        job_id: JobId,
+    ) where
+        'job: 'scope,
+    {
+        *active_jobs += 1;
+        let exec = exec[job_id.0].take().unwrap();
+
+        scope.spawn(move |_| {
+            let mut job = jobs[job_id.0].try_lock().unwrap();
+
+            let result = exec(&mut *job);
+            sender.send((job_id, result)).unwrap();
+        });
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobId(usize);
 
-pub struct Job<'job> {
-    spec: JobSpec,
-    exec: Box<dyn FnOnce(&mut JobSpec) -> anyhow::Result<()> + Send + 'job>,
-}
-
-pub struct JobSpec {
+pub struct Job {
     pub name: String,
     pub inputs: Vec<JobInput>,
     pub outputs: Vec<JobOutput>,
@@ -164,5 +320,44 @@ impl JobOutput {
 
     pub fn from_data(data: impl AsRef<[u8]>) -> Self {
         JobOutput::Data(data.as_ref().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_graph() {
+        use super::*;
+
+        let mut graph = TaskGraph::new();
+
+        let job1 = Job {
+            name: "job1".to_string(),
+            inputs: vec![],
+            outputs: vec![JobOutput::from_file("output1.txt")],
+        };
+        graph.add_job(job1, |_| {});
+
+        let job2 = Job {
+            name: "job2".to_string(),
+            inputs: vec![JobInput::from_file("output1.txt")],
+            outputs: vec![JobOutput::from_file("output2.txt")],
+        };
+        graph.add_job(job2, |_| {});
+
+        let relations = graph.build_relations().unwrap();
+
+        assert_eq!(relations.len(), 2);
+
+        assert_eq!(relations[0].input_edges, &[]);
+        assert_eq!(relations[0].output_edges, &[JobId(1)]);
+
+        assert_eq!(relations[1].input_edges, &[JobId(0)]);
+        assert_eq!(relations[1].output_edges, &[]);
+
+        let (input_counts, ready_jobs) = graph.build_input_counts(&relations);
+
+        assert_eq!(input_counts, &[0, 1]);
+        assert_eq!(ready_jobs, vec![JobId(0)]);
     }
 }

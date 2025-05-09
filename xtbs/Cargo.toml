@@ -9,4 +9,5 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+rayon.workspace = true
 serde = { workspace = true, features = ["derive"] }

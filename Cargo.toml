@@ -11,4 +11,5 @@ rust-version = "1.85.0"
 
 [workspace.dependencies]
 anyhow = "1.0.98"
+rayon = "1"
 serde = "1"
