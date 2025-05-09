@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["xtbs"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+
+[workspace.lints]
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+serde = "1"
