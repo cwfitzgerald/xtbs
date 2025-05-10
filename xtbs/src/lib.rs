@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     path::{Path, PathBuf},
-    sync::{Mutex, mpsc::Sender},
+    sync::{
+        Mutex,
+        mpsc::{Receiver, Sender},
+    },
 };
 
 pub use anyhow;
@@ -63,72 +66,20 @@ impl<'job> TaskGraph<'job> {
     pub fn run(mut self) -> anyhow::Result<()> {
         let relations = self.build_relations()?;
 
-        let (mut unresolved_input_counts, mut ready_jobs) = self.build_input_counts(&relations);
+        let (mut unresolved_input_counts, ready_jobs) = self.build_input_counts(&relations);
 
         // Channel to communicate finished jobs back to the main thread
         let (sender, receiver) = std::sync::mpsc::channel::<(JobId, anyhow::Result<()>)>();
 
         let results = rayon::in_place_scope(|scope| {
-            let mut active_jobs = 0_usize;
-            let mut results = Vec::new();
-            results.resize_with(self.jobs.len(), || None);
-
-            // Launch all the ready to run jobs
-            for job_id in ready_jobs.drain(..) {
-                Self::launch_job(
-                    &self.jobs,
-                    &mut self.exec,
-                    &mut active_jobs,
-                    scope,
-                    &sender,
-                    job_id,
-                );
-            }
-
-            // Wait for jobs to finish
-            while let Some((job_id, result)) = {
-                // If there are no more active jobs, we can break out of the loop
-                if active_jobs != 0 {
-                    receiver.recv().ok()
-                } else {
-                    None
-                }
-            } {
-                // Decrement the active job count
-                active_jobs -= 1;
-
-                let errored = result.is_err();
-
-                // Store the result
-                results[job_id.0] = Some(result);
-
-                if errored {
-                    continue;
-                }
-
-                // Decrement the unresolved input counts for all jobs that depend on this job
-                for output_job_id in &relations[job_id.0].output_edges {
-                    let count = &mut unresolved_input_counts[output_job_id.0];
-                    *count -= 1;
-                    if *count == 0 {
-                        // This job is now ready to run
-                        ready_jobs.push(*output_job_id);
-                    }
-                }
-
-                // Launch all the ready to run jobs
-                for job_id in ready_jobs.drain(..) {
-                    Self::launch_job(
-                        &self.jobs,
-                        &mut self.exec,
-                        &mut active_jobs,
-                        scope,
-                        &sender,
-                        job_id,
-                    );
-                }
-            }
-            results
+            self.run_scope(
+                &relations,
+                &mut unresolved_input_counts,
+                ready_jobs,
+                &sender,
+                receiver,
+                scope,
+            )
         });
 
         // If there were any errors, print them out, then return an error.
@@ -151,7 +102,7 @@ impl<'job> TaskGraph<'job> {
 
         // If there are any jobs that still have unresolved input edges,
         // there was a cycle in the graph.
-        for (job_id, count) in unresolved_input_counts.iter_mut().enumerate() {
+        for (job_id, count) in unresolved_input_counts.iter().enumerate() {
             if *count > 0 {
                 return Err(anyhow::anyhow!(
                     "Job \"{}\"(ID {}) was part of a cycle in the graph.",
@@ -168,6 +119,8 @@ impl<'job> TaskGraph<'job> {
         let mut relations: Vec<NodeRelation> = vec![NodeRelation::default(); self.jobs.len()];
         let mut output_files: HashMap<PathBuf, JobId> = HashMap::with_capacity(self.jobs.len());
 
+        // First iterate over all outputs, ensuring there are no duplicate outputs,
+        // and building the mapping from path to job id.
         for (index, job) in self.jobs.iter_mut().enumerate() {
             let job_id = JobId(index);
             let job = job.get_mut().unwrap();
@@ -191,8 +144,6 @@ impl<'job> TaskGraph<'job> {
                 }
             }
         }
-        // First iterate over all outputs, ensuring there are no duplicate outputs,
-        // and building the mapping from path to job id.
 
         // Now iterate over all inputs, connecting them with the outputs.
         for (index, job) in self.jobs.iter_mut().enumerate() {
@@ -239,11 +190,85 @@ impl<'job> TaskGraph<'job> {
         (unresolved_input_counts, ready_jobs)
     }
 
+    fn run_scope<'scope>(
+        &'scope mut self,
+        relations: &Vec<NodeRelation>,
+        unresolved_input_counts: &mut Vec<usize>,
+        mut ready_jobs: Vec<JobId>,
+        sender: &'scope Sender<(JobId, anyhow::Result<()>)>,
+        receiver: Receiver<(JobId, anyhow::Result<()>)>,
+        scope: &impl Scope<'scope>,
+    ) -> Vec<Option<anyhow::Result<()>>>
+    where
+        'job: 'scope,
+    {
+        let mut active_jobs = 0_usize;
+        let mut results = Vec::new();
+        results.resize_with(self.jobs.len(), || None);
+
+        // Launch all the ready to run jobs
+        for job_id in ready_jobs.drain(..) {
+            Self::launch_job(
+                &self.jobs,
+                &mut self.exec,
+                &mut active_jobs,
+                scope,
+                sender,
+                job_id,
+            );
+        }
+
+        // Wait for jobs to finish
+        while let Some((job_id, result)) = {
+            // If there are no more active jobs, we can break out of the loop
+            if active_jobs != 0 {
+                receiver.recv().ok()
+            } else {
+                None
+            }
+        } {
+            // Decrement the active job count
+            active_jobs -= 1;
+
+            let errored = result.is_err();
+
+            // Store the result
+            results[job_id.0] = Some(result);
+
+            if errored {
+                continue;
+            }
+
+            // Decrement the unresolved input counts for all jobs that depend on this job
+            for output_job_id in &relations[job_id.0].output_edges {
+                let count = &mut unresolved_input_counts[output_job_id.0];
+                *count -= 1;
+                if *count == 0 {
+                    // This job is now ready to run
+                    ready_jobs.push(*output_job_id);
+                }
+            }
+
+            // Launch all the ready to run jobs
+            for job_id in ready_jobs.drain(..) {
+                Self::launch_job(
+                    &self.jobs,
+                    &mut self.exec,
+                    &mut active_jobs,
+                    scope,
+                    &sender,
+                    job_id,
+                );
+            }
+        }
+        results
+    }
+
     fn launch_job<'scope>(
         jobs: &'scope Vec<Mutex<Job>>,
         exec: &mut Vec<Option<BoxJobExec<'job>>>,
         active_jobs: &mut usize,
-        scope: &rayon::Scope<'scope>,
+        scope: &impl Scope<'scope>,
         sender: &'scope Sender<(JobId, anyhow::Result<()>)>,
         job_id: JobId,
     ) where
@@ -252,12 +277,30 @@ impl<'job> TaskGraph<'job> {
         *active_jobs += 1;
         let exec = exec[job_id.0].take().unwrap();
 
-        scope.spawn(move |_| {
+        scope.spawn(move || {
             let mut job = jobs[job_id.0].try_lock().unwrap();
 
             let result = exec(&mut *job);
             sender.send((job_id, result)).unwrap();
         });
+    }
+}
+
+trait Scope<'scope> {
+    fn spawn(&self, f: impl FnOnce() + Send + 'scope);
+}
+
+impl<'scope> Scope<'scope> for rayon::Scope<'scope> {
+    fn spawn(&self, f: impl FnOnce() + Send + 'scope) {
+        self.spawn(move |_| f());
+    }
+}
+
+struct NoopScope;
+
+impl<'scope> Scope<'scope> for NoopScope {
+    fn spawn(&self, f: impl FnOnce() + Send + 'scope) {
+        f();
     }
 }
 
