@@ -66,7 +66,7 @@ impl<'job> TaskGraph<'job> {
     pub fn run(mut self) -> anyhow::Result<()> {
         let relations = self.build_relations()?;
 
-        let (mut unresolved_input_counts, ready_jobs) = self.build_input_counts(&relations);
+        let (mut unresolved_input_counts, mut ready_jobs) = self.build_input_counts(&relations);
 
         // Channel to communicate finished jobs back to the main thread
         let (sender, receiver) = std::sync::mpsc::channel::<(JobId, anyhow::Result<()>)>();
@@ -75,7 +75,7 @@ impl<'job> TaskGraph<'job> {
             self.run_scope(
                 &relations,
                 &mut unresolved_input_counts,
-                ready_jobs,
+                &mut ready_jobs,
                 &sender,
                 receiver,
                 scope,
@@ -194,10 +194,10 @@ impl<'job> TaskGraph<'job> {
         &'scope mut self,
         relations: &Vec<NodeRelation>,
         unresolved_input_counts: &mut Vec<usize>,
-        mut ready_jobs: Vec<JobId>,
+        ready_jobs: &mut Vec<JobId>,
         sender: &'scope Sender<(JobId, anyhow::Result<()>)>,
         receiver: Receiver<(JobId, anyhow::Result<()>)>,
-        scope: &impl Scope<'scope>,
+        scope: &rayon::Scope<'scope>,
     ) -> Vec<Option<anyhow::Result<()>>>
     where
         'job: 'scope,
@@ -268,7 +268,7 @@ impl<'job> TaskGraph<'job> {
         jobs: &'scope Vec<Mutex<Job>>,
         exec: &mut Vec<Option<BoxJobExec<'job>>>,
         active_jobs: &mut usize,
-        scope: &impl Scope<'scope>,
+        scope: &rayon::Scope<'scope>,
         sender: &'scope Sender<(JobId, anyhow::Result<()>)>,
         job_id: JobId,
     ) where
@@ -277,30 +277,12 @@ impl<'job> TaskGraph<'job> {
         *active_jobs += 1;
         let exec = exec[job_id.0].take().unwrap();
 
-        scope.spawn(move || {
+        scope.spawn(move |_| {
             let mut job = jobs[job_id.0].try_lock().unwrap();
 
             let result = exec(&mut *job);
             sender.send((job_id, result)).unwrap();
         });
-    }
-}
-
-trait Scope<'scope> {
-    fn spawn(&self, f: impl FnOnce() + Send + 'scope);
-}
-
-impl<'scope> Scope<'scope> for rayon::Scope<'scope> {
-    fn spawn(&self, f: impl FnOnce() + Send + 'scope) {
-        self.spawn(move |_| f());
-    }
-}
-
-struct NoopScope;
-
-impl<'scope> Scope<'scope> for NoopScope {
-    fn spawn(&self, f: impl FnOnce() + Send + 'scope) {
-        f();
     }
 }
 
@@ -368,11 +350,21 @@ impl JobOutput {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
+    use super::*;
+
     #[test]
     fn test_graph() {
-        use super::*;
-
         let mut graph = TaskGraph::new();
+
+        // Define them intentionally out of order
+        let job2 = Job {
+            name: "job2".to_string(),
+            inputs: vec![JobInput::from_file("output1.txt")],
+            outputs: vec![JobOutput::from_file("output2.txt")],
+        };
+        graph.add_job(job2, |_| {});
 
         let job1 = Job {
             name: "job1".to_string(),
@@ -381,26 +373,67 @@ mod tests {
         };
         graph.add_job(job1, |_| {});
 
-        let job2 = Job {
-            name: "job2".to_string(),
-            inputs: vec![JobInput::from_file("output1.txt")],
-            outputs: vec![JobOutput::from_file("output2.txt")],
-        };
-        graph.add_job(job2, |_| {});
-
         let relations = graph.build_relations().unwrap();
 
         assert_eq!(relations.len(), 2);
 
-        assert_eq!(relations[0].input_edges, &[]);
-        assert_eq!(relations[0].output_edges, &[JobId(1)]);
+        assert_eq!(relations[0].input_edges, &[JobId(1)]);
+        assert_eq!(relations[0].output_edges, &[]);
 
-        assert_eq!(relations[1].input_edges, &[JobId(0)]);
-        assert_eq!(relations[1].output_edges, &[]);
+        assert_eq!(relations[1].input_edges, &[]);
+        assert_eq!(relations[1].output_edges, &[JobId(0)]);
 
-        let (input_counts, ready_jobs) = graph.build_input_counts(&relations);
+        let (mut unresolved_input_counts, mut ready_jobs) = graph.build_input_counts(&relations);
 
-        assert_eq!(input_counts, &[0, 1]);
-        assert_eq!(ready_jobs, vec![JobId(0)]);
+        assert_eq!(unresolved_input_counts, &[1, 0]);
+        assert_eq!(ready_jobs, vec![JobId(1)]);
+
+        let (sender, receiver) = std::sync::mpsc::channel::<(JobId, anyhow::Result<()>)>();
+
+        let results = rayon::in_place_scope(|scope| {
+            graph.run_scope(
+                &relations,
+                &mut unresolved_input_counts,
+                &mut ready_jobs,
+                &sender,
+                receiver,
+                scope,
+            )
+        });
+
+        assert_eq!(unresolved_input_counts, &[0, 0]);
+        assert_eq!(ready_jobs, &[]);
+        assert!(matches!(results[0], Some(Ok(()))));
+        assert!(matches!(results[1], Some(Ok(()))));
+    }
+
+    #[test]
+    fn test_parallelism() {
+        let mut graph = TaskGraph::new();
+
+        // By using a barrier, we can ensure that the two jobs run in parallel
+        // as if they run one-by-one, this will deadlock.
+        let barrier = Barrier::new(2);
+
+        let job1 = Job {
+            name: "job1".to_string(),
+            inputs: vec![JobInput::from_file("input1.txt")],
+            outputs: vec![JobOutput::from_file("output1.txt")],
+        };
+        graph.add_job(job1, |_| {
+            barrier.wait();
+        });
+
+        let job2 = Job {
+            name: "job2".to_string(),
+            inputs: vec![JobInput::from_file("input2.txt")],
+            outputs: vec![JobOutput::from_file("output2.txt")],
+        };
+        graph.add_job(job2, |_| {
+            barrier.wait();
+        });
+
+        let result = graph.run();
+        assert!(result.is_ok());
     }
 }
